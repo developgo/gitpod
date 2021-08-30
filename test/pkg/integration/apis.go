@@ -17,7 +17,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gitpod-io/gitpod/common-go/log"
 	"github.com/google/uuid"
 	"golang.org/x/xerrors"
 	"google.golang.org/grpc"
@@ -25,12 +24,13 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/client-go/kubernetes"
+	"sigs.k8s.io/e2e-framework/klient"
 
 	// Gitpod uses mysql, so it makes sense to make this DB driver available
 	// by default.
 	_ "github.com/go-sql-driver/mysql"
 
+	"github.com/gitpod-io/gitpod/common-go/log"
 	csapi "github.com/gitpod-io/gitpod/content-service/api"
 	gitpod "github.com/gitpod-io/gitpod/gitpod-protocol"
 	imgbldr "github.com/gitpod-io/gitpod/image-builder/api"
@@ -70,10 +70,6 @@ type ComponentAPI struct {
 		BlobServiceClient csapi.BlobServiceClient
 		ContentService    ContentService
 	}
-	dbStatus struct {
-		Config *DBConfig
-		DB     *sql.DB
-	}
 	imgbldStatus struct {
 		Port   int
 		Client imgbldr.ImageBuilderClient
@@ -106,7 +102,7 @@ func (c *ComponentAPI) Supervisor(instanceID string) (res grpc.ClientConnInterfa
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	ready, errc := forwardPort(ctx, c.t.restConfig, c.t.namespace, pod, fmt.Sprintf("%d:22999", localPort))
+	ready, errc := forwardPort(ctx, c.t.client.RESTConfig(), "", pod, fmt.Sprintf("%d:22999", localPort))
 	select {
 	case err = <-errc:
 		cancel()
@@ -167,8 +163,9 @@ func (c *ComponentAPI) GitpodServer(opts ...GitpodServerOpt) (res gitpod.APIInte
 			c.serverStatus.Token[options.User] = tkn
 		}
 
-		pods, err := c.t.clientset.CoreV1().Pods(c.t.namespace).List(context.Background(), metav1.ListOptions{
-			LabelSelector: "component=server",
+		var pods corev1.PodList
+		err := c.t.client.Resources(c.t.namespace).List(context.Background(), &pods, func(opts *metav1.ListOptions) {
+			opts.LabelSelector = "component=server"
 		})
 		if err != nil {
 			return err
@@ -267,11 +264,6 @@ func (c *ComponentAPI) createGitpodToken(user string) (tkn string, err error) {
 	return tkn, nil
 }
 
-// Kubernetes provides access to the Kubernetes cluster we're connected to
-func (c *ComponentAPI) Kubernetes() (cl kubernetes.Interface, namespace string) {
-	return c.t.clientset, c.t.namespace
-}
-
 // WorkspaceManager provides access to ws-manager
 func (c *ComponentAPI) WorkspaceManager() wsmanapi.WorkspaceManagerClient {
 	var rerr error
@@ -286,6 +278,7 @@ func (c *ComponentAPI) WorkspaceManager() wsmanapi.WorkspaceManagerClient {
 	if c.wsmanStatus.Client != nil {
 		return c.wsmanStatus.Client
 	}
+
 	if c.wsmanStatus.Port == 0 {
 		pod, _, err := c.t.selectPod(ComponentWorkspaceManager, selectPodOptions{})
 		if err != nil {
@@ -300,7 +293,7 @@ func (c *ComponentAPI) WorkspaceManager() wsmanapi.WorkspaceManagerClient {
 		}
 
 		ctx, cancel := context.WithCancel(context.Background())
-		ready, errc := forwardPort(ctx, c.t.restConfig, c.t.namespace, pod, fmt.Sprintf("%d:8080", localPort))
+		ready, errc := forwardPort(ctx, c.t.client.RESTConfig(), c.t.namespace, pod, fmt.Sprintf("%d:8080", localPort))
 		select {
 		case rerr = <-errc:
 			cancel()
@@ -313,11 +306,14 @@ func (c *ComponentAPI) WorkspaceManager() wsmanapi.WorkspaceManagerClient {
 
 	secretName := "ws-manager-client-tls"
 	ctx, cancel := context.WithCancel(context.Background())
-	secret, err := c.t.clientset.CoreV1().Secrets(c.t.namespace).Get(ctx, secretName, metav1.GetOptions{})
+
+	var secret corev1.Secret
+	err := c.t.client.Resources().Get(ctx, secretName, c.t.namespace, &secret)
 	if err != nil {
 		log.Fatal(err)
 	}
 	cancel()
+
 	caCrt := secret.Data["ca.crt"]
 	tlsCrt := secret.Data["tls.crt"]
 	tlsKey := secret.Data["tls.key"]
@@ -379,7 +375,7 @@ func (c *ComponentAPI) BlobService() csapi.BlobServiceClient {
 		}
 
 		ctx, cancel := context.WithCancel(context.Background())
-		ready, errc := forwardPort(ctx, c.t.restConfig, c.t.namespace, pod, fmt.Sprintf("%d:8080", localPort))
+		ready, errc := forwardPort(ctx, c.t.client.RESTConfig(), c.t.namespace, pod, fmt.Sprintf("%d:8080", localPort))
 		select {
 		case rerr = <-errc:
 			cancel()
@@ -404,10 +400,6 @@ func (c *ComponentAPI) BlobService() csapi.BlobServiceClient {
 // DB provides access to the Gitpod database.
 // Callers must never close the DB.
 func (c *ComponentAPI) DB() *sql.DB {
-	if c.dbStatus.DB != nil {
-		return c.dbStatus.DB
-	}
-
 	var rerr error
 	defer func() {
 		if rerr == nil {
@@ -417,20 +409,16 @@ func (c *ComponentAPI) DB() *sql.DB {
 		c.t.t.Fatalf("cannot access database: %q", rerr)
 	}()
 
-	if c.dbStatus.Config == nil {
-		config, err := c.findDBConfig()
-		if err != nil {
-			rerr = err
-			return nil
-		}
-		c.dbStatus.Config = config
+	config, err := c.findDBConfig()
+	if err != nil {
+		rerr = err
+		return nil
 	}
-	config := c.dbStatus.Config
 
 	// if configured: setup local port-forward to DB pod
 	if config.ForwardPort != nil {
 		ctx, cancel := context.WithCancel(context.Background())
-		ready, errc := forwardPort(ctx, c.t.restConfig, c.t.namespace, config.ForwardPort.PodName, fmt.Sprintf("%d:%d", config.Port, config.ForwardPort.RemotePort))
+		ready, errc := forwardPort(ctx, c.t.client.RESTConfig(), c.t.namespace, config.ForwardPort.PodName, fmt.Sprintf("%d:%d", config.Port, config.ForwardPort.RemotePort))
 		select {
 		case err := <-errc:
 			cancel()
@@ -447,19 +435,19 @@ func (c *ComponentAPI) DB() *sql.DB {
 		return nil
 	}
 
-	c.dbStatus.DB = db
 	c.t.closer = append(c.t.closer, db.Close)
 	return db
 }
 
 func (c *ComponentAPI) findDBConfig() (*DBConfig, error) {
-	config, err := c.findDBConfigFromPodEnv("server")
+	config, err := FindDBConfigFromPodEnv("server", c.t.namespace, c.t.client)
 	if err != nil {
 		return nil, err
 	}
 
 	// here we _assume_ that "config" points to a service: find us a concrete DB pod to forward to
-	svc, err := c.t.clientset.CoreV1().Services(c.t.namespace).Get(context.Background(), config.Host, metav1.GetOptions{})
+	var svc corev1.Service
+	err = c.t.client.Resources(c.t.namespace).Get(context.Background(), config.Host, c.t.namespace, &svc)
 	if err != nil {
 		return nil, err
 	}
@@ -480,8 +468,9 @@ func (c *ComponentAPI) findDBConfig() (*DBConfig, error) {
 	}
 
 	// find pod to forward to
-	pods, err := c.t.clientset.CoreV1().Pods(c.t.namespace).List(context.Background(), metav1.ListOptions{
-		LabelSelector: labels.SelectorFromSet(svc.Spec.Selector).String(),
+	var pods corev1.PodList
+	err = c.t.client.Resources(c.t.namespace).List(context.Background(), &pods, func(opts *metav1.ListOptions) {
+		opts.LabelSelector = labels.SelectorFromSet(svc.Spec.Selector).String()
 	})
 	if err != nil {
 		return nil, err
@@ -527,10 +516,11 @@ func (c *ComponentAPI) findDBConfig() (*DBConfig, error) {
 	return config, nil
 }
 
-func (c *ComponentAPI) findDBConfigFromPodEnv(componentName string) (*DBConfig, error) {
+func FindDBConfigFromPodEnv(componentName string, namespace string, client klient.Client) (*DBConfig, error) {
 	lblSelector := fmt.Sprintf("component=%s", componentName)
-	list, err := c.t.clientset.CoreV1().Pods(c.t.namespace).List(context.Background(), metav1.ListOptions{
-		LabelSelector: lblSelector,
+	var list corev1.PodList
+	err := client.Resources(namespace).List(context.Background(), &list, func(opts *metav1.ListOptions) {
+		opts.LabelSelector = lblSelector
 	})
 	if err != nil {
 		return nil, err
@@ -613,7 +603,7 @@ func (c *ComponentAPI) ImageBuilder(opts ...APIImageBuilderOpt) imgbldr.ImageBui
 			}
 
 			ctx, cancel := context.WithCancel(context.Background())
-			ready, errc := forwardPort(ctx, c.t.restConfig, c.t.namespace, pod, fmt.Sprintf("%d:8080", localPort))
+			ready, errc := forwardPort(ctx, c.t.client.RESTConfig(), c.t.namespace, pod, fmt.Sprintf("%d:8080", localPort))
 			select {
 			case err = <-errc:
 				cancel()
@@ -673,7 +663,7 @@ func (c *ComponentAPI) ContentService() ContentService {
 		}
 
 		ctx, cancel := context.WithCancel(context.Background())
-		ready, errc := forwardPort(ctx, c.t.restConfig, c.t.namespace, pod, fmt.Sprintf("%d:8080", localPort))
+		ready, errc := forwardPort(ctx, c.t.client.RESTConfig(), c.t.namespace, pod, fmt.Sprintf("%d:8080", localPort))
 		select {
 		case rerr = <-errc:
 			cancel()

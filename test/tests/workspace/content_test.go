@@ -118,7 +118,7 @@ func TestMissingBackup(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.Name+"_backup_init", func(t *testing.T) {
-			it := it.Child(t)
+			//it := it.Child(t)
 			testws := integration.LaunchWorkspaceDirectly(it, integration.WithRequestModifier(func(w *wsapi.StartWorkspaceRequest) error {
 				w.ServicePrefix = ws.Req.ServicePrefix
 				w.Metadata.MetaId = ws.Req.Metadata.MetaId

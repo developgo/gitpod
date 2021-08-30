@@ -16,9 +16,9 @@ import (
 	"golang.org/x/xerrors"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/gitpod-io/gitpod/common-go/namegen"
 	csapi "github.com/gitpod-io/gitpod/content-service/api"
@@ -132,8 +132,9 @@ func LaunchWorkspaceDirectly(it *Test, opts ...LaunchWorkspaceDirectlyOpt) (res 
 
 	ideImage := options.IdeImage
 	if ideImage == "" {
-		pods, err := it.clientset.CoreV1().Pods(it.namespace).List(context.Background(), metav1.ListOptions{
-			LabelSelector: "component=server",
+		var pods corev1.PodList
+		err := it.client.Resources(it.namespace).List(context.Background(), &pods, func(opts *metav1.ListOptions) {
+			opts.LabelSelector = "component=server"
 		})
 		if err != nil {
 			it.t.Fatalf("cannot find server pod: %q", err)
@@ -187,14 +188,14 @@ func LaunchWorkspaceDirectly(it *Test, opts ...LaunchWorkspaceDirectlyOpt) (res 
 		}
 	}
 
-	sctx, scancel := context.WithTimeout(it.ctx, perCallTimeout)
+	sctx, scancel := context.WithTimeout(context.Background(), perCallTimeout)
 	sresp, err := it.API().WorkspaceManager().StartWorkspace(sctx, req)
 	scancel()
 	if err != nil {
 		it.t.Fatalf("cannot start workspace: %q", err)
 	}
 
-	lastStatus := it.WaitForWorkspaceStart(it.ctx, instanceID.String(), options.WaitForOpts...)
+	lastStatus := it.WaitForWorkspaceStart(context.Background(), instanceID.String(), options.WaitForOpts...)
 
 	it.t.Logf("workspace is running: instanceID=%s", instanceID.String())
 
@@ -217,7 +218,7 @@ func LaunchWorkspaceFromContextURL(it *Test, contextURL string, serverOpts ...Gi
 	}
 	server := it.API().GitpodServer(append(defaultServerOpts, serverOpts...)...)
 
-	cctx, ccancel := context.WithTimeout(it.ctx, perCallTimeout)
+	cctx, ccancel := context.WithTimeout(context.Background(), perCallTimeout)
 	defer ccancel()
 	resp, err := server.CreateWorkspace(cctx, &protocol.CreateWorkspaceOptions{
 		ContextURL: contextURL,
@@ -227,7 +228,7 @@ func LaunchWorkspaceFromContextURL(it *Test, contextURL string, serverOpts ...Gi
 		it.t.Fatalf("cannot start workspace: %q", err)
 	}
 	stopWs = func(waitForStop bool) {
-		sctx, scancel := context.WithTimeout(it.ctx, perCallTimeout)
+		sctx, scancel := context.WithTimeout(context.Background(), perCallTimeout)
 		err := server.StopWorkspace(sctx, resp.CreatedWorkspaceID)
 		scancel()
 		if err != nil {
@@ -245,7 +246,7 @@ func LaunchWorkspaceFromContextURL(it *Test, contextURL string, serverOpts ...Gi
 	}()
 	it.t.Logf("created workspace: workspaceID=%s url=%s", resp.CreatedWorkspaceID, resp.WorkspaceURL)
 
-	nfo, err = server.GetWorkspace(it.ctx, resp.CreatedWorkspaceID)
+	nfo, err = server.GetWorkspace(context.Background(), resp.CreatedWorkspaceID)
 	if err != nil {
 		it.t.Fatalf("cannot get workspace: %q", err)
 	}
@@ -254,7 +255,7 @@ func LaunchWorkspaceFromContextURL(it *Test, contextURL string, serverOpts ...Gi
 		it.t.Fatal(err)
 	}
 
-	it.WaitForWorkspaceStart(it.ctx, nfo.LatestInstance.ID)
+	it.WaitForWorkspaceStart(context.Background(), nfo.LatestInstance.ID)
 
 	it.t.Logf("workspace is running: instanceID=%s", nfo.LatestInstance.ID)
 
@@ -385,7 +386,7 @@ func (t *Test) WaitForWorkspaceStart(ctx context.Context, instanceID string, opt
 // fails or does not stop before the context is canceled.
 func (it *Test) WaitForWorkspaceStop(instanceID string) (lastStatus *wsmanapi.WorkspaceStatus) {
 	wsman := it.API().WorkspaceManager()
-	sub, err := wsman.Subscribe(it.ctx, &wsmanapi.SubscribeRequest{})
+	sub, err := wsman.Subscribe(context.Background(), &wsmanapi.SubscribeRequest{})
 	if err != nil {
 		it.t.Fatalf("cannot listen for workspace updates: %q", err)
 		return
@@ -425,7 +426,7 @@ func (it *Test) WaitForWorkspaceStop(instanceID string) (lastStatus *wsmanapi.Wo
 	}()
 
 	// maybe the workspace has stopped in the meantime and we've missed the update
-	desc, _ := wsman.DescribeWorkspace(it.ctx, &wsmanapi.DescribeWorkspaceRequest{Id: instanceID})
+	desc, _ := wsman.DescribeWorkspace(context.Background(), &wsmanapi.DescribeWorkspaceRequest{Id: instanceID})
 	if desc != nil {
 		switch desc.Status.Phase {
 		case wsmanapi.WorkspacePhase_STOPPED:
@@ -441,15 +442,15 @@ func (it *Test) WaitForWorkspaceStop(instanceID string) (lastStatus *wsmanapi.Wo
 	}
 
 	// wait for the Theia service to be properly deleted
-	ctx, cancel := context.WithTimeout(it.ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	var (
 		start       = time.Now()
 		serviceGone bool
-		k8s, ns     = it.API().Kubernetes()
 	)
 	for time.Since(start) < 1*time.Minute {
-		_, err := k8s.CoreV1().Services(ns).Get(ctx, fmt.Sprintf("ws-%s-theia", workspaceID), v1.GetOptions{})
+		var svc corev1.Service
+		err := it.client.Resources().Get(ctx, fmt.Sprintf("ws-%s-theia", workspaceID), it.namespace, &svc)
 		if errors.IsNotFound(err) {
 			serviceGone = true
 			break

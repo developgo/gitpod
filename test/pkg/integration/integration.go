@@ -8,7 +8,6 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
-	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -28,113 +27,35 @@ import (
 	"golang.org/x/xerrors"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/portforward"
 	"k8s.io/client-go/tools/remotecommand"
 	"k8s.io/client-go/transport/spdy"
-
-	// most of our infra runs on GCP, so it's handy to bake GCP auth support right in
-	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
-)
-
-const cfgFlagDefault = "$HOME/.kube/config"
-
-var (
-	cfgFlag       = flag.String("kubeconfig", cfgFlagDefault, "path to the kubeconfig file, use \"in-cluster\" to make use of in cluster Kubernetes config")
-	namespaceFlag = flag.String("namespace", "", "namespace to execute the test against. Defaults to the one configured in \"kubeconfig\".")
-	usernameFlag  = flag.String("username", "", "username to execute the tests with. Chooses one automatically if left blank.")
+	"sigs.k8s.io/e2e-framework/klient"
 )
 
 // NewTest produces a new integration test instance
-func NewTest(t *testing.T, timeout time.Duration) (*Test, context.Context) {
-	flag.Parse()
-	kubeconfig := *cfgFlag
-	namespaceOverride := *namespaceFlag
-	username := *usernameFlag
-
-	if kubeconfig == cfgFlagDefault {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			t.Fatal("cannot determine user home dir", err)
-		}
-		kubeconfig = filepath.Join(home, ".kube", "config")
-	} else if kubeconfig == "in-cluster" {
-		kubeconfig = ""
-	}
-
-	restConfig, ns, err := getKubeconfig(kubeconfig)
-	if err != nil {
-		t.Fatal("cannot load kubeconfig", err)
-	}
-	client, err := kubernetes.NewForConfig(restConfig)
-	if err != nil {
-		t.Fatal("cannot connecto Kubernetes", err)
-	}
-
-	if namespaceOverride != "" {
-		ns = namespaceOverride
-	}
-
-	ctx, ctxCancel := context.WithTimeout(context.Background(), timeout)
+func NewTest(ctx context.Context, t *testing.T, namespace string, client klient.Client) *Test {
 	return &Test{
-		t:          t,
-		clientset:  client,
-		restConfig: restConfig,
-		namespace:  ns,
-		ctx:        ctx,
-		ctxCancel:  ctxCancel,
-		username:   username,
-	}, ctx
+		t:   t,
+		ctx: ctx,
+
+		namespace: namespace,
+
+		client: client,
+	}
 }
 
-// GetKubeconfig loads kubernetes connection config from a kubeconfig file
-func getKubeconfig(kubeconfig string) (res *rest.Config, namespace string, err error) {
-	if kubeconfig == "" {
-		res, err = rest.InClusterConfig()
-		if err != nil {
-			return
-		}
-
-		var data []byte
-		data, err = os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
-		if err != nil {
-			return
-		}
-		namespace = strings.TrimSpace(string(data))
-		return
-	}
-
-	cfg := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
-		&clientcmd.ClientConfigLoadingRules{ExplicitPath: kubeconfig},
-		&clientcmd.ConfigOverrides{},
-	)
-	namespace, _, err = cfg.Namespace()
-	if err != nil {
-		return nil, "", err
-	}
-
-	res, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
-	if err != nil {
-		return nil, namespace, err
-	}
-
-	return res, namespace, nil
-}
-
-// Test encapsulates integration test functionality
 type Test struct {
-	t          *testing.T
-	clientset  kubernetes.Interface
-	restConfig *rest.Config
-	namespace  string
-	ctx        context.Context
+	t   *testing.T
+	ctx context.Context
 
-	closer    []func() error
-	ctxCancel func()
-	api       *ComponentAPI
+	namespace string
+	client    klient.Client
+
+	closer []func() error
+	api    *ComponentAPI
 
 	// username contains the string passed to the test per flag. Might be empty.
 	username string
@@ -143,8 +64,6 @@ type Test struct {
 // Done must be called after the test has run. It cleans up instrumentation
 // and modifications made by the test.
 func (it *Test) Done() {
-	it.ctxCancel()
-
 	// Much "defer", we run the closer in reversed order. This way, we can
 	// append to this list quite naturally, and still break things down in
 	// the correct order.
@@ -281,7 +200,8 @@ func (it *Test) Instrument(component ComponentType, agentName string, opts ...In
 			cancel()
 		}
 	}()
-	fwdReady, fwdErr := forwardPort(ctx, it.restConfig, it.namespace, podName, strconv.Itoa(localAgentPort))
+
+	fwdReady, fwdErr := forwardPort(ctx, it.client.RESTConfig(), it.namespace, podName, strconv.Itoa(localAgentPort))
 	select {
 	case <-fwdReady:
 	case err = <-execErrs:
@@ -320,22 +240,6 @@ func (it *Test) Instrument(component ComponentType, agentName string, opts ...In
 	})
 
 	return res, nil
-}
-
-func (it *Test) Child(t *testing.T) *Test {
-	ctx, cancel := context.WithCancel(it.ctx)
-	res := &Test{
-		t:          t,
-		clientset:  it.clientset,
-		restConfig: it.restConfig,
-		namespace:  it.namespace,
-		ctx:        ctx,
-		ctxCancel:  cancel,
-		api:        it.api,
-		username:   it.username,
-	}
-	it.closer = append(it.closer, func() error { res.Done(); return nil })
-	return res
 }
 
 func getFreePort() (int, error) {
@@ -410,7 +314,11 @@ func forwardPort(ctx context.Context, config *rest.Config, namespace, pod, port 
 }
 
 func (it *Test) executeAgent(cmd []string, pod, container string) (err error) {
-	restClient := it.clientset.CoreV1().RESTClient()
+	restClient, err := rest.RESTClientFor(it.client.RESTConfig())
+	if err != nil {
+		return err
+	}
+
 	req := restClient.Post().
 		Resource("pods").
 		Name(pod).
@@ -426,7 +334,7 @@ func (it *Test) executeAgent(cmd []string, pod, container string) (err error) {
 		TTY:       true,
 	}, scheme.ParameterCodec)
 
-	exec, err := remotecommand.NewSPDYExecutor(it.restConfig, "POST", req.URL())
+	exec, err := remotecommand.NewSPDYExecutor(it.client.RESTConfig(), "POST", req.URL())
 	if err != nil {
 		return err
 	}
@@ -451,7 +359,11 @@ func (it *Test) uploadAgent(srcFN, tgtFN string, pod, container string) (err err
 
 	tarIn, tarOut := io.Pipe()
 
-	restClient := it.clientset.CoreV1().RESTClient()
+	restClient, err := rest.RESTClientFor(it.client.RESTConfig())
+	if err != nil {
+		return err
+	}
+
 	req := restClient.Post().
 		Resource("pods").
 		Name(pod).
@@ -467,7 +379,7 @@ func (it *Test) uploadAgent(srcFN, tgtFN string, pod, container string) (err err
 		TTY:       false,
 	}, scheme.ParameterCodec)
 
-	exec, err := remotecommand.NewSPDYExecutor(it.restConfig, "POST", req.URL())
+	exec, err := remotecommand.NewSPDYExecutor(it.client.RESTConfig(), "POST", req.URL())
 	if err != nil {
 		return xerrors.Errorf("cannot upload agent: %w", err)
 	}
@@ -547,9 +459,9 @@ func (t *Test) selectPod(component ComponentType, options selectPodOptions) (pod
 		listOptions.LabelSelector = "component=workspace,workspaceID=" + options.InstanceID
 	}
 	if component == ComponentWorkspaceDaemon && options.InstanceID != "" {
-		var pods *corev1.PodList
-		pods, err = t.clientset.CoreV1().Pods(t.namespace).List(context.Background(), metav1.ListOptions{
-			LabelSelector: "component=workspace,workspaceID=" + options.InstanceID,
+		var pods corev1.PodList
+		err = t.client.Resources(t.namespace).List(context.Background(), &pods, func(opts *metav1.ListOptions) {
+			opts.LabelSelector = "component=workspace,workspaceID=" + options.InstanceID
 		})
 		if err != nil {
 			err = xerrors.Errorf("cannot list pods: %w", err)
@@ -562,7 +474,11 @@ func (t *Test) selectPod(component ComponentType, options selectPodOptions) (pod
 		listOptions.FieldSelector = "spec.nodeName=" + pods.Items[0].Spec.NodeName
 	}
 
-	pods, err := t.clientset.CoreV1().Pods(t.namespace).List(context.Background(), listOptions)
+	var pods corev1.PodList
+	err = t.client.Resources(t.namespace).List(context.Background(), &pods, func(opts *metav1.ListOptions) {
+		opts.LabelSelector = listOptions.LabelSelector
+		opts.FieldSelector = listOptions.FieldSelector
+	})
 	if err != nil {
 		err = xerrors.Errorf("cannot list pods: %w", err)
 		return
@@ -597,7 +513,7 @@ func (t *Test) selectPod(component ComponentType, options selectPodOptions) (pod
 	return
 }
 
-func envvarFromPod(pods *corev1.PodList, name, containerName string) (value string, err error) {
+func envvarFromPod(pods corev1.PodList, name, containerName string) (value string, err error) {
 	if len(pods.Items) == 0 {
 		return "", xerrors.Errorf("envvarFromPod: no pods found for %s", name)
 	}
